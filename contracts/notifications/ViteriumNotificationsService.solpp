@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: MIT
+pragma soliditypp ^0.8.0;
+
+contract ViteriumNotificationsService {
+    address public owner;
+    string public publicKey;
+
+    constructor(string memory pubKey) {
+        owner = msg.sender;
+        publicKey = pubKey;
+    }
+
+    receive() external payable {
+        revert();
+    }
+
+    event TokenUpdated(bytes32 hash);
+    function updateToken(string calldata) external {
+        emit TokenUpdated(fromhash());
+    }
+
+    event IdLinked(address indexed addr, bytes32 hash);
+    function linkId(bytes calldata) external {
+        emit IdLinked(msg.sender, fromhash());
+    }
+
+    mapping(address => mapping(bytes32 => uint)) _settings;
+    event SettingsChanged(address indexed addr, bytes32 indexed id, uint settings, bytes32 hash);
+    function _changeSettings(address addr, bytes32 id, uint settings) private {
+        _settings[addr][id] = settings;
+        emit SettingsChanged(addr, id, settings, fromhash());
+    }
+
+    function changeSettings(bytes32 id, uint settings) external {
+        _changeSettings(msg.sender, id, settings);
+    }
+
+    function getSettings(address addr, bytes32 id) view external returns (uint settings) {
+        return _settings[addr][id];
+    }
+
+    event ResetRequested(bytes32 hash);
+    function reset(bytes calldata) external {
+        emit ResetRequested(fromhash());
+    }
+
+    function disable(address addr, bytes32 id) external {
+        require(msg.sender == owner);
+
+        _changeSettings(addr, id, 0);
+    }
+}
