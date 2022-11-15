@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: MIT
+pragma soliditypp ^0.8.0;
+
+interface TokenIssuance {
+    function Burn() external payable;
+}
+
+interface Consensus {
+    function VoteForSBP(string calldata sbpName) external;
+    function CancelSBPVoting() external;
+}
+
+contract ViteriumPresale {
+    vitetoken constant VT_TOKEN = 'tti_b18e6488eeb30541da7f5010';
+    vitetoken constant VITE_TOKEN = 'tti_5649544520544f4b454e6e40';
+
+    // Length of early bird codes and ref codes
+    uint constant kInputLength = 16;
+    bytes16 constant kHexSymbols = "0123456789abcdef";
+
+    address constant kTokenIssuanceAddress = 'vite_000000000000000000000000000000000000000595292d996d';
+    TokenIssuance constant kTokenIssuance = TokenIssuance(kTokenIssuanceAddress);
+
+    address constant kConsensusAddress = "vite_0000000000000000000000000000000000000004d28108e76b";
+    Consensus constant kConsensus = Consensus(kConsensusAddress);
+
+    // Presale Duration approx 30 days
+    uint constant kBlocksInDay = 24*60*60;
+    uint constant kDurationPresale = 30*kBlocksInDay; // 30 Days
+    uint constant kDurationRefund = 3*kBlocksInDay; // 3 Days
+
+    // 1 VT in Raw
+    uint constant kVTRaw = 1e18;
+    // 1 Million
+    uint constant k1M = 1e6;
+    // 200M VT
+    uint constant kTotalClaimableVT = 200*k1M*kVTRaw;
+    // 10M VT for referral bonus
+    uint constant kTotalBonusVT = 10*k1M*kVTRaw;
+    // 100 NFTs
+    uint constant kTotalNFTs = 100;
+    // 1M VT per NFT
+    uint constant kVTPerNFT = k1M*kVTRaw;
+    // 100M VT (1M VITE) presale success threshold
+    uint constant kSuccessThresholdVT = 100*k1M*kVTRaw;
+    // 10K VITE EarlyBird
+    uint constant kEarlyBirdVITE = 1e4*1e18;
+    // 100K VT (1K VITE) referral code threshold
+    uint constant kReferralCodeThresholdVT = 1e5*kVTRaw;
+    // 100 VT for 1 VITE
+    uint constant kVTMultiplier = 100;
+    // 5% referral bonus
+    uint constant kBonusMultiplier = 5;
+
+    enum State {
+        initial,
+        earlyBird,
+        inProgress,
+        refund,
+        refundEnded,
+        ended
+    }
+
+    State public state = State.initial;
+    uint public startBlock;
+    address immutable owner;
+
+    mapping(bytes32 => bool) public earlyBirdCodes;
+    mapping(address => bool) public earlyBirdAddresses;
+
+    mapping(address => bytes16) public refCodes;
+    mapping(bytes16 => address) public refAddresses;
+    mapping(bytes16 => uint) public refBonusVT;
+
+    mapping(address => uint) public userClaimedVT;
+    mapping(address => uint) public userClaimedNFTs;
+
+    function userInfo(address addr) public view returns (uint claimedVT, uint claimedNFTs, uint bonusVT, bytes16 refCode, bool isEarlyBird) {
+        claimedVT = userClaimedVT[addr];
+        claimedNFTs = userClaimedNFTs[addr];
+        refCode = refCodes[addr];
+        bonusVT = refBonusVT[refCode];
+        isEarlyBird = earlyBirdAddresses[addr];
+    }
+
+    uint public totalClaimedVT = 0;
+    uint public totalClaimedNFTs = 0;
+    uint public totalBonusVT = 0;
+
+    function stateInfo() public view returns (uint8, uint, uint, uint, uint, uint, uint) {
+        uint endBlock = startBlock + kDurationPresale;
+        uint refundEndBlock = endBlock + kDurationRefund;
+        return (uint8(state), startBlock, endBlock, refundEndBlock, totalClaimedVT, totalClaimedNFTs, totalBonusVT);
+    }
+
+    bool public withdrawnBonusVT = false;
+    bool public burnedUnclaimedVT = false;
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    /// Modifiers
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, 'Only owner can call this function');
+        _;
+    }
+    modifier onlyEarlyBird() {
+        require(state == State.earlyBird, 'Only available in early bird state');
+        _;
+    }
+    modifier onlyRefund() {
+        require(state == State.refund, 'Only available in refund state');
+        _;
+    }
+    modifier onlyRefundEnded() {
+        require(state == State.refundEnded, 'Only available in refund ended state');
+        _;
+    }
+    modifier onlyEnded() {
+        require(state == State.ended, 'Only available in presale ended state');
+        _;
+    }
+    modifier onlyAllowedTokens() {
+        require(msg.token == VT_TOKEN || msg.token == VITE_TOKEN);
+        _;
+    }
+
+    /// Events
+    event StateChanged(State newState, State oldState);
+    event EarlyBirdClaimed(address indexed addr);
+    event RefCodeCreated(address indexed addr, bytes16 refCode);
+    event Claimed(address indexed addr, uint claimedVT);
+    event Refunded(address indexed addr, uint refundedVT);
+    event BonusClaimed(address indexed addr, uint bonusVT);
+
+    /// Fallback and receive
+
+    fallback (bytes calldata input) external payable returns (bytes memory) {
+        require(input.length == kInputLength, 'Invalid input length');
+        _processRequest(input);
+        return '';
+    }
+
+    receive () external payable {
+        _processRequest('');
+    }
+
+    /// Fund the presale and set start block
+
+    function fund(uint presaleStartBlock) external payable onlyOwner {
+        require(state == State.initial);
+        require(msg.token == VT_TOKEN);
+        require(msg.value == kTotalClaimableVT + kTotalBonusVT);
+        require(presaleStartBlock > block.number);
+
+        startBlock = presaleStartBlock;
+        state = State.earlyBird;
+        emit StateChanged(state, State.initial);
+    }
+
+    /// Early Bird
+
+    function addEarlyBirdCode(bytes32 code) external onlyOwner {
+        earlyBirdCodes[code] = true;
+    }
+
+    /// Private functions
+
+    function _updateState() private {
+        if (state == State.initial || state == State.ended || state == State.refundEnded) {
+           return;
+        }
+
+        if (state == State.earlyBird && block.number >= startBlock) {
+            state = State.inProgress;
+            emit StateChanged(state, State.earlyBird);
+            return;
+        }
+
+        if (state == State.inProgress && totalClaimedVT >= kTotalClaimableVT) {
+            state = State.ended;
+            emit StateChanged(state, State.inProgress);
+            return;
+        }
+
+        uint endBlock = startBlock + kDurationPresale;
+        if (state == State.inProgress && block.number >= endBlock) {
+            if (totalClaimedVT >= kSuccessThresholdVT) {
+                state = State.ended;
+            } else {
+                state = State.refund;
+            }
+            emit StateChanged(state, State.inProgress);
+            return;
+        }
+
+        uint endRefundBlock = endBlock + kDurationRefund;
+        if (state == State.refund && block.number >= endRefundBlock) {
+            state = State.refundEnded;
+            emit StateChanged(state, State.refund);
+            return;
+        }
+    }
+
+    function _processRequest(bytes memory input) private onlyAllowedTokens {
+        require(state != State.initial);
+
+        if (msg.value == 0) {
+            _updateState();
+            return;
+        }
+
+        if (state == State.earlyBird) {
+            _claimEarlyBird(input);
+        } else if (state == State.inProgress) {
+            _claim(input);
+        } else if (state == State.refund) {
+            _refund();
+        } else {
+            revert('Presale ended');
+        }
+
+        // Update state after processing request
+        _updateState();
+    }
+
+    function _claimEarlyBird(bytes memory input) private onlyEarlyBird {
+        require(msg.token == VITE_TOKEN && msg.value == kEarlyBirdVITE, 'Only 10K VITE');
+        require(earlyBirdAddresses[msg.sender] == false, 'Only one early bird per address');
+
+        bytes32 code = blake2b(input);
+        require(earlyBirdCodes[code] == true, 'Invalid early bird code');
+
+        // Claim early bird
+        uint claimedVT = msg.value * kVTMultiplier;
+        userClaimedVT[msg.sender] = claimedVT;
+        userClaimedNFTs[msg.sender] = 1;
+
+        totalClaimedVT += claimedVT;
+        totalClaimedNFTs += 1;
+
+        // Early birds also get a ref code
+        _createRefCode(msg.sender);
+
+        // And the referral bonus
+        bytes16 refCode = refCodes[msg.sender];
+        uint refBonus = msg.value * kBonusMultiplier;
+        refBonusVT[refCode] += refBonus;
+        totalBonusVT += refBonus;
+
+        earlyBirdCodes[code] = false;
+        earlyBirdAddresses[msg.sender] = true;
+
+        payable(msg.sender).transfer(VT_TOKEN, claimedVT);
+        emit Claimed(msg.sender, claimedVT);
+    }
+
+    function _claim(bytes memory data) private {
+        require(msg.token == VITE_TOKEN);
+        require(msg.value > 0);
+
+        uint claimedVT = msg.value * kVTMultiplier;
+        require(claimedVT <= claimableVT(), 'Not enough VT left');
+
+        // Check ref code
+        if (data.length == kInputLength) {
+            bytes16 refCode = _convertRefCode(data);
+            if (refAddresses[refCode] != address(0)) {
+                uint refBonus = msg.value * kBonusMultiplier;
+                refBonusVT[refCode] += refBonus;
+                totalBonusVT += refBonus;
+            }
+        }
+
+        totalClaimedNFTs -= userClaimedNFTs[msg.sender];
+        uint availableNFTs = 0;
+        if (kTotalNFTs > totalClaimedNFTs) {
+            availableNFTs = kTotalNFTs - totalClaimedNFTs;
+        }
+
+        totalClaimedVT += claimedVT;
+        userClaimedVT[msg.sender] += claimedVT;
+
+        uint claimedNFTs = userClaimedVT[msg.sender] / kVTPerNFT;
+        if (claimedNFTs > availableNFTs) {
+            claimedNFTs = availableNFTs;
+        }
+
+        userClaimedNFTs[msg.sender] = claimedNFTs;
+        totalClaimedNFTs += claimedNFTs;
+
+        if (userClaimedVT[msg.sender] >= kReferralCodeThresholdVT) {
+            _createRefCode(msg.sender);
+        }
+
+        payable(msg.sender).transfer(VT_TOKEN, claimedVT);
+        emit EarlyBirdClaimed(msg.sender);
+        emit Claimed(msg.sender, claimedVT);
+    }
+
+    function _refund() private onlyRefund {
+        require(msg.token == VT_TOKEN);
+
+        uint claimedVT = userClaimedVT[msg.sender];
+        require(claimedVT == msg.value);
+
+        uint refundVITE = claimedVT / kVTMultiplier;
+        totalClaimedVT -= claimedVT;
+        totalClaimedNFTs -= userClaimedNFTs[msg.sender];
+
+        userClaimedVT[msg.sender] = 0;
+        userClaimedNFTs[msg.sender] = 0;
+
+        payable(msg.sender).transfer(VITE_TOKEN, refundVITE);
+        emit Refunded(msg.sender, claimedVT);
+    }
+
+    /// Presale Unsuccessful (state == State.refundEnded)
+
+    // Withdraw any VITE and VT
+    function withdrawAfterRefund() external onlyOwner onlyRefundEnded {
+        uint viteBalance = balance(VITE_TOKEN);
+        payable(owner).transfer(VITE_TOKEN, viteBalance);
+
+        uint vtBalance = balance(VT_TOKEN);
+        payable(owner).transfer(VT_TOKEN, vtBalance);
+    }
+
+    /// Presale Successful (state == State.ended)
+
+    // Withdraw VITE after presale ends successfully
+    function withdrawVITE() external onlyOwner onlyEnded {
+        uint viteBalance = balance(VITE_TOKEN);
+        payable(owner).transfer(VITE_TOKEN, viteBalance);
+    }
+
+    // Settle VT balance after presale ends successfully
+    function settleVT() external onlyOwner onlyEnded {
+        // Withdraw remaining bonus VT
+        if (!withdrawnBonusVT && kTotalBonusVT > totalBonusVT) {
+            uint remainingBonusVT = kTotalBonusVT - totalBonusVT;
+            payable(owner).transfer(VT_TOKEN, remainingBonusVT);
+            withdrawnBonusVT = true;
+        }
+
+        // Burn unclaimed VT
+        if (!burnedUnclaimedVT && kTotalClaimableVT > totalClaimedVT) {
+            uint burnVT = kTotalClaimableVT - totalClaimedVT;
+            kTokenIssuance.Burn{value: burnVT, token: VT_TOKEN}();
+            burnedUnclaimedVT = true;
+        }
+    }
+
+    // Withdraw referral bonus
+    function claimBonus() external {
+        _sendBonus(msg.sender);
+    }
+
+    // Allow owner to send referral bonus
+    function sendBonus(address addr) external onlyOwner {
+        _sendBonus(addr);
+    }
+
+    function _sendBonus(address addr) private onlyEnded {
+        bytes16 refCode = refCodes[addr];
+        require(refCode != 0, 'No referral code for address');
+
+        uint bonus = refBonusVT[refCode];
+        require(bonus > 0, 'No bonus for address');
+
+        refBonusVT[refCode] = 0;
+        payable(addr).transfer(VT_TOKEN, bonus);
+        emit BonusClaimed(addr, bonus);
+    }
+
+    /// Helpers
+
+    function claimableVT() public view returns (uint) {
+        if (totalClaimedVT >= kTotalClaimableVT) {
+            return 0;
+        }
+        return kTotalClaimableVT - totalClaimedVT;
+    }
+
+    /// Referral codes
+
+    function _bytesToHex(bytes8 buffer) internal pure returns (string memory) {
+        bytes memory converted = new bytes(buffer.length * 2);
+        for (uint i = 0; i < buffer.length; ++i) {
+            converted[i * 2] = kHexSymbols[uint8(buffer[i]) / 16];
+            converted[i * 2 + 1] = kHexSymbols[uint8(buffer[i]) % 16];
+        }
+        return string(converted);
+    }
+
+    function _convertRefCode(bytes memory input) internal pure returns (bytes16 refCode) {
+        assembly {
+             refCode := mload(add(input, 32))
+        }
+    }
+
+    function _createRefCode(address addr) private {
+        if (refCodes[addr] != 0) {
+            return;
+        }
+        uint64 random = random64();
+        bytes8 refCodeBytes = bytes8(random);
+
+        string memory refCodeHex = _bytesToHex(refCodeBytes);
+        bytes16 refCode = _convertRefCode(bytes(refCodeHex));
+
+        require(refAddresses[refCode] == address(0), 'RefCode already in use');
+
+        refCodes[addr] = refCode;
+        refAddresses[refCode] = addr;
+
+        emit RefCodeCreated(addr, refCode);
+    }
+
+    /// Vote for SBP
+
+    function voteForSbp(string calldata sbpName) external onlyOwner {
+        kConsensus.VoteForSBP(sbpName);
+    }
+
+    function cancelSbpVoting() external onlyOwner {
+        kConsensus.CancelSBPVoting();
+    }
+
+    /// Failsafe
+
+    // Just in case something goes wrong we should be able to recover all VITE funds
+    function withdrawFailsafe() external onlyOwner {
+        uint viteBalance = balance(VITE_TOKEN);
+        payable(owner).transfer(VITE_TOKEN, viteBalance);
+
+        State oldState = state;
+        state = State.ended;
+        emit StateChanged(state, oldState);
+    }
+}
